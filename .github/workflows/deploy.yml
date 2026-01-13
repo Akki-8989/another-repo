@@ -45,29 +45,32 @@ jobs:
       working-directory: ./terraform
       run: terraform init
 
-    - name: Check and Import Existing Resource Group
+    - name: Import Existing Resources
       working-directory: ./terraform
       run: |
         # Build resource group name (matching Terraform's naming logic)
         APP_NAME="${{ github.event.repository.name }}"
         RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
         
-        echo "Checking if resource group '$RG_NAME' exists..."
+        echo "=== Checking Resource Group: $RG_NAME ==="
         
-        if az group exists --name "$RG_NAME" | grep -q "true"; then
+        # Check if resource group exists in Azure
+        RG_EXISTS=$(az group exists --name "$RG_NAME")
+        
+        if [ "$RG_EXISTS" = "true" ]; then
           echo "Resource group '$RG_NAME' exists in Azure."
           
           # Check if already in Terraform state
-          if terraform state show azurerm_resource_group.main > /dev/null 2>&1; then
+          if terraform state list | grep -q "azurerm_resource_group.main"; then
             echo "Resource group already in Terraform state. Skipping import."
           else
             echo "Importing resource group into Terraform state..."
-            RG_ID=$(az group show --name "$RG_NAME" --query id -o tsv)
-            terraform import -var="app_name=${{ github.event.repository.name }}" azurerm_resource_group.main "$RG_ID"
+            RG_ID="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RG_NAME"
+            terraform import -var="app_name=$APP_NAME" azurerm_resource_group.main "$RG_ID"
             echo "Import successful."
           fi
         else
-          echo "Resource group '$RG_NAME' does not exist. Will be created by Terraform."
+          echo "Resource group '$RG_NAME' does not exist in Azure. Terraform will create it."
         fi
 
     - name: Terraform Plan
