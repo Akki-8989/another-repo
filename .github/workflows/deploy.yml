@@ -42,14 +42,12 @@ jobs:
         
         # Auto-detect if not specified or validate
         if [ -f "package.json" ]; then
-          # Check if it's a frontend project
           if grep -q '"react"\|"vue"\|"@angular/core"\|"next"\|"vite"' package.json 2>/dev/null; then
             PROJECT_TYPE="frontend"
           fi
         fi
         
         if [ -f "*.csproj" ] || find . -name "*.csproj" -type f | head -1 | grep -q "."; then
-          # Has .NET project file
           if [ "$PROJECT_TYPE" != "frontend" ]; then
             PROJECT_TYPE="backend"
           fi
@@ -57,9 +55,7 @@ jobs:
         
         echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
         
-        # Set paths based on project type
         if [ "$PROJECT_TYPE" = "frontend" ]; then
-          # Detect frontend framework and set build output
           if [ -f "package.json" ]; then
             if grep -q '"next"' package.json; then
               echo "build_command=npm run build" >> $GITHUB_OUTPUT
@@ -83,7 +79,6 @@ jobs:
           fi
           echo "project_path=." >> $GITHUB_OUTPUT
         else
-          # Backend - find .csproj file
           CSPROJ_PATH=$(find . -name "*.csproj" -type f | head -1)
           if [ -n "$CSPROJ_PATH" ]; then
             echo "project_path=$CSPROJ_PATH" >> $GITHUB_OUTPUT
@@ -138,30 +133,104 @@ jobs:
         RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
         SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
         PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
+        RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
         
         echo "=========================================="
         echo "Project Type: $PROJECT_TYPE"
-        echo "Checking Resource Group: $RG_NAME"
+        echo "Resource Prefix: $RESOURCE_PREFIX"
         echo "=========================================="
         
-        # Check if resource group exists in Azure
-        RG_EXISTS=$(az group exists --name "$RG_NAME")
-        
-        if [ "$RG_EXISTS" = "true" ]; then
-          echo "Resource group '$RG_NAME' EXISTS in Azure"
+        # Function to import resource if exists in Azure but not in state
+        import_if_exists() {
+          local RESOURCE_TYPE=$1
+          local RESOURCE_ADDRESS=$2
+          local RESOURCE_ID=$3
+          local CHECK_COMMAND=$4
+          
+          echo ""
+          echo "--- Checking $RESOURCE_TYPE ---"
           
           # Check if already in Terraform state
-          if terraform state list 2>/dev/null | grep -q "azurerm_resource_group.main"; then
-            echo "Already in Terraform state - SKIP IMPORT"
-          else
-            echo "Importing resource group into Terraform state..."
-            RG_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
-            terraform import -var="app_name=$APP_NAME" -var="project_type=$PROJECT_TYPE" azurerm_resource_group.main "$RG_ID"
-            echo "Import successful"
+          if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
+            echo "$RESOURCE_TYPE: Already in Terraform state - SKIP"
+            return 0
           fi
-        else
-          echo "Resource group '$RG_NAME' does NOT exist - will be created"
+          
+          # Check if exists in Azure
+          if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
+            echo "$RESOURCE_TYPE: EXISTS in Azure, importing..."
+            terraform import \
+              -var="app_name=$APP_NAME" \
+              -var="project_type=$PROJECT_TYPE" \
+              "$RESOURCE_ADDRESS" "$RESOURCE_ID" && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED (may not exist)"
+          else
+            echo "$RESOURCE_TYPE: Does NOT exist in Azure - will be created"
+          fi
+        }
+        
+        # 1. Resource Group
+        import_if_exists \
+          "Resource Group" \
+          "azurerm_resource_group.main" \
+          "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME" \
+          "az group exists --name $RG_NAME | grep -q true"
+        
+        # Backend Resources
+        if [ "$PROJECT_TYPE" = "backend" ]; then
+          
+          # 2. App Service Plan
+          import_if_exists \
+            "App Service Plan" \
+            "azurerm_service_plan.main[0]" \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-plan" \
+            "az appservice plan show --name ${RESOURCE_PREFIX}-plan --resource-group $RG_NAME"
+          
+          # 3. Web App
+          import_if_exists \
+            "Web App" \
+            "azurerm_windows_web_app.main[0]" \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp" \
+            "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"
+          
+          # 4. SQL Server (if SQL password is provided)
+          if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ]; then
+            import_if_exists \
+              "SQL Server" \
+              "azurerm_mssql_server.main[0]" \
+              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver" \
+              "az sql server show --name ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"
+            
+            # 5. SQL Database
+            import_if_exists \
+              "SQL Database" \
+              "azurerm_mssql_database.main[0]" \
+              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/databases/${RESOURCE_PREFIX}-db" \
+              "az sql db show --name ${RESOURCE_PREFIX}-db --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"
+            
+            # 6. SQL Firewall Rule
+            import_if_exists \
+              "SQL Firewall Rule" \
+              "azurerm_mssql_firewall_rule.allow_azure[0]" \
+              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/firewallRules/AllowAzureServices" \
+              "az sql server firewall-rule show --name AllowAzureServices --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"
+          fi
         fi
+        
+        # Frontend Resources
+        if [ "$PROJECT_TYPE" = "frontend" ]; then
+          
+          # Static Web App
+          import_if_exists \
+            "Static Web App" \
+            "azurerm_static_web_app.main[0]" \
+            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/staticSites/${RESOURCE_PREFIX}-static" \
+            "az staticwebapp show --name ${RESOURCE_PREFIX}-static --resource-group $RG_NAME"
+        fi
+        
+        echo ""
+        echo "=========================================="
+        echo "Import process completed"
+        echo "=========================================="
 
     - name: Terraform Plan
       working-directory: ./terraform
