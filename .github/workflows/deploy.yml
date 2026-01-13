@@ -40,7 +40,6 @@ jobs:
       run: |
         PROJECT_TYPE="${{ github.event.inputs.project_type || 'backend' }}"
         
-        # Auto-detect if not specified or validate
         if [ -f "package.json" ]; then
           if grep -q '"react"\|"vue"\|"@angular/core"\|"next"\|"vite"' package.json 2>/dev/null; then
             PROJECT_TYPE="frontend"
@@ -128,109 +127,180 @@ jobs:
 
     - name: Import Existing Resources
       working-directory: ./terraform
+      env:
+        SQL_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
       run: |
         APP_NAME="${{ github.event.repository.name }}"
         RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
         SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
         PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
         RESOURCE_PREFIX=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')
+        HAS_SQL_PASSWORD="false"
+        
+        if [ -n "$SQL_PASSWORD" ]; then
+          HAS_SQL_PASSWORD="true"
+        fi
         
         echo "=========================================="
         echo "Project Type: $PROJECT_TYPE"
         echo "Resource Prefix: $RESOURCE_PREFIX"
+        echo "Has SQL Password: $HAS_SQL_PASSWORD"
         echo "=========================================="
         
-        # Function to import resource if exists in Azure but not in state
-        import_if_exists() {
+        # Function to check if resource exists in Azure
+        resource_exists_in_azure() {
+          local CHECK_COMMAND=$1
+          if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
+            return 0
+          else
+            return 1
+          fi
+        }
+        
+        # Function to check if resource exists in Terraform state
+        resource_in_state() {
+          local RESOURCE_ADDRESS=$1
+          if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
+            return 0
+          else
+            return 1
+          fi
+        }
+        
+        # Function to import resource
+        import_resource() {
           local RESOURCE_TYPE=$1
           local RESOURCE_ADDRESS=$2
           local RESOURCE_ID=$3
-          local CHECK_COMMAND=$4
           
           echo ""
-          echo "--- Checking $RESOURCE_TYPE ---"
+          echo "--- Importing $RESOURCE_TYPE ---"
           
-          # Check if already in Terraform state
-          if terraform state list 2>/dev/null | grep -q "$RESOURCE_ADDRESS"; then
-            echo "$RESOURCE_TYPE: Already in Terraform state - SKIP"
-            return 0
-          fi
-          
-          # Check if exists in Azure
-          if eval "$CHECK_COMMAND" > /dev/null 2>&1; then
-            echo "$RESOURCE_TYPE: EXISTS in Azure, importing..."
+          if [ "$HAS_SQL_PASSWORD" = "true" ]; then
             terraform import \
               -var="app_name=$APP_NAME" \
               -var="project_type=$PROJECT_TYPE" \
-              "$RESOURCE_ADDRESS" "$RESOURCE_ID" && echo "$RESOURCE_TYPE: Import SUCCESS" || echo "$RESOURCE_TYPE: Import FAILED (may not exist)"
+              -var="sql_admin_password=$SQL_PASSWORD" \
+              "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS ✓" || echo "$RESOURCE_TYPE: Import FAILED ✗"
           else
-            echo "$RESOURCE_TYPE: Does NOT exist in Azure - will be created"
+            terraform import \
+              -var="app_name=$APP_NAME" \
+              -var="project_type=$PROJECT_TYPE" \
+              "$RESOURCE_ADDRESS" "$RESOURCE_ID" 2>&1 && echo "$RESOURCE_TYPE: Import SUCCESS ✓" || echo "$RESOURCE_TYPE: Import FAILED ✗"
           fi
         }
         
         # 1. Resource Group
-        import_if_exists \
-          "Resource Group" \
-          "azurerm_resource_group.main" \
-          "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME" \
-          "az group exists --name $RG_NAME | grep -q true"
+        echo ""
+        echo "=== Checking Resource Group ==="
+        if resource_in_state "azurerm_resource_group.main"; then
+          echo "Resource Group: Already in state - SKIP"
+        elif resource_exists_in_azure "az group exists --name $RG_NAME | grep -q true"; then
+          echo "Resource Group: EXISTS in Azure"
+          import_resource "Resource Group" "azurerm_resource_group.main" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
+        else
+          echo "Resource Group: Does NOT exist - will be created"
+        fi
         
         # Backend Resources
         if [ "$PROJECT_TYPE" = "backend" ]; then
           
           # 2. App Service Plan
-          import_if_exists \
-            "App Service Plan" \
-            "azurerm_service_plan.main[0]" \
-            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-plan" \
-            "az appservice plan show --name ${RESOURCE_PREFIX}-plan --resource-group $RG_NAME"
+          echo ""
+          echo "=== Checking App Service Plan ==="
+          if resource_in_state "azurerm_service_plan.main\[0\]"; then
+            echo "App Service Plan: Already in state - SKIP"
+          elif resource_exists_in_azure "az appservice plan show --name ${RESOURCE_PREFIX}-plan --resource-group $RG_NAME"; then
+            echo "App Service Plan: EXISTS in Azure"
+            import_resource "App Service Plan" "azurerm_service_plan.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/serverFarms/${RESOURCE_PREFIX}-plan"
+          else
+            echo "App Service Plan: Does NOT exist - will be created"
+          fi
           
           # 3. Web App
-          import_if_exists \
-            "Web App" \
-            "azurerm_windows_web_app.main[0]" \
-            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp" \
-            "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"
+          echo ""
+          echo "=== Checking Web App ==="
+          if resource_in_state "azurerm_windows_web_app.main\[0\]"; then
+            echo "Web App: Already in state - SKIP"
+          elif resource_exists_in_azure "az webapp show --name ${RESOURCE_PREFIX}-webapp --resource-group $RG_NAME"; then
+            echo "Web App: EXISTS in Azure"
+            import_resource "Web App" "azurerm_windows_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/sites/${RESOURCE_PREFIX}-webapp"
+          else
+            echo "Web App: Does NOT exist - will be created"
+          fi
           
-          # 4. SQL Server (if SQL password is provided)
-          if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ]; then
-            import_if_exists \
-              "SQL Server" \
-              "azurerm_mssql_server.main[0]" \
-              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver" \
-              "az sql server show --name ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"
-            
-            # 5. SQL Database
-            import_if_exists \
-              "SQL Database" \
-              "azurerm_mssql_database.main[0]" \
-              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/databases/${RESOURCE_PREFIX}-db" \
-              "az sql db show --name ${RESOURCE_PREFIX}-db --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"
-            
-            # 6. SQL Firewall Rule
-            import_if_exists \
-              "SQL Firewall Rule" \
-              "azurerm_mssql_firewall_rule.allow_azure[0]" \
-              "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/firewallRules/AllowAzureServices" \
-              "az sql server firewall-rule show --name AllowAzureServices --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"
+          # 4. SQL Server (Always check if exists in Azure, regardless of password)
+          echo ""
+          echo "=== Checking SQL Server ==="
+          if resource_in_state "azurerm_mssql_server.main\[0\]"; then
+            echo "SQL Server: Already in state - SKIP"
+          elif resource_exists_in_azure "az sql server show --name ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+            echo "SQL Server: EXISTS in Azure"
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              import_resource "SQL Server" "azurerm_mssql_server.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver"
+            else
+              echo "SQL Server: WARNING - Cannot import without SQL_ADMIN_PASSWORD secret"
+            fi
+          else
+            echo "SQL Server: Does NOT exist - will be created (if password provided)"
+          fi
+          
+          # 5. SQL Database
+          echo ""
+          echo "=== Checking SQL Database ==="
+          if resource_in_state "azurerm_mssql_database.main\[0\]"; then
+            echo "SQL Database: Already in state - SKIP"
+          elif resource_exists_in_azure "az sql db show --name ${RESOURCE_PREFIX}-db --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+            echo "SQL Database: EXISTS in Azure"
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              import_resource "SQL Database" "azurerm_mssql_database.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/databases/${RESOURCE_PREFIX}-db"
+            else
+              echo "SQL Database: WARNING - Cannot import without SQL_ADMIN_PASSWORD secret"
+            fi
+          else
+            echo "SQL Database: Does NOT exist - will be created (if password provided)"
+          fi
+          
+          # 6. SQL Firewall Rule
+          echo ""
+          echo "=== Checking SQL Firewall Rule ==="
+          if resource_in_state "azurerm_mssql_firewall_rule.allow_azure\[0\]"; then
+            echo "SQL Firewall Rule: Already in state - SKIP"
+          elif resource_exists_in_azure "az sql server firewall-rule show --name AllowAzureServices --server ${RESOURCE_PREFIX}-sqlserver --resource-group $RG_NAME"; then
+            echo "SQL Firewall Rule: EXISTS in Azure"
+            if [ "$HAS_SQL_PASSWORD" = "true" ]; then
+              import_resource "SQL Firewall Rule" "azurerm_mssql_firewall_rule.allow_azure[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Sql/servers/${RESOURCE_PREFIX}-sqlserver/firewallRules/AllowAzureServices"
+            else
+              echo "SQL Firewall Rule: WARNING - Cannot import without SQL_ADMIN_PASSWORD secret"
+            fi
+          else
+            echo "SQL Firewall Rule: Does NOT exist - will be created (if password provided)"
           fi
         fi
         
         # Frontend Resources
         if [ "$PROJECT_TYPE" = "frontend" ]; then
-          
-          # Static Web App
-          import_if_exists \
-            "Static Web App" \
-            "azurerm_static_web_app.main[0]" \
-            "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/staticSites/${RESOURCE_PREFIX}-static" \
-            "az staticwebapp show --name ${RESOURCE_PREFIX}-static --resource-group $RG_NAME"
+          echo ""
+          echo "=== Checking Static Web App ==="
+          if resource_in_state "azurerm_static_web_app.main\[0\]"; then
+            echo "Static Web App: Already in state - SKIP"
+          elif resource_exists_in_azure "az staticwebapp show --name ${RESOURCE_PREFIX}-static --resource-group $RG_NAME"; then
+            echo "Static Web App: EXISTS in Azure"
+            import_resource "Static Web App" "azurerm_static_web_app.main[0]" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Web/staticSites/${RESOURCE_PREFIX}-static"
+          else
+            echo "Static Web App: Does NOT exist - will be created"
+          fi
         fi
         
         echo ""
         echo "=========================================="
         echo "Import process completed"
         echo "=========================================="
+        
+        # Show current state
+        echo ""
+        echo "=== Current Terraform State ==="
+        terraform state list 2>/dev/null || echo "No resources in state yet"
 
     - name: Terraform Plan
       working-directory: ./terraform
