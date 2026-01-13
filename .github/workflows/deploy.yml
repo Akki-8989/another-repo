@@ -190,17 +190,7 @@ jobs:
           fi
         }
         
-        # 1. Resource Group
-        echo ""
-        echo "=== Checking Resource Group ==="
-        if resource_in_state "azurerm_resource_group.main"; then
-          echo "Resource Group: Already in state - SKIP"
-        elif resource_exists_in_azure "az group exists --name $RG_NAME | grep -q true"; then
-          echo "Resource Group: EXISTS in Azure"
-          import_resource "Resource Group" "azurerm_resource_group.main" "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
-        else
-          echo "Resource Group: Does NOT exist - will be created"
-        fi
+      
         
         # Backend Resources
         if [ "$PROJECT_TYPE" = "backend" ]; then
