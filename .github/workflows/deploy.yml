@@ -90,7 +90,14 @@ jobs:
         
         echo "Detected project type: $PROJECT_TYPE"
 
- 
+  terraform:
+    runs-on: ubuntu-latest
+    needs: detect-and-setup
+    outputs:
+      webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
+      resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+      static_webapp_name: ${{ steps.terraform_output.outputs.static_webapp_name }}
+      deployment_token: ${{ steps.terraform_output.outputs.deployment_token }}
 
     steps:
     - name: Checkout code
