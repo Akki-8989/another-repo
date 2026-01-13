@@ -138,7 +138,7 @@ resource "azurerm_static_web_app" "main" {
   count               = local.is_frontend ? 1 : 0
   name                = "${local.resource_prefix}-static"
   resource_group_name = azurerm_resource_group.main.name
-  location            = "eastasia"  # Static Web Apps have limited regions
+  location            = "eastasia"
   sku_tier            = "Free"
   sku_size            = "Free"
 
@@ -172,7 +172,7 @@ output "static_webapp_name" {
 }
 
 output "static_webapp_url" {
-  value = local.is_frontend ? "https://${azurerm_static_web_app.main[0].default_hostname}" : ""
+  value = local.is_frontend ? "https://${azurerm_static_web_app.main[0].default_host_name}" : ""
 }
 
 output "static_webapp_api_key" {
