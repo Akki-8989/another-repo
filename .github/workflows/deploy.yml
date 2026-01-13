@@ -7,17 +7,103 @@ on:
         description: 'Branch to deploy'
         required: false
         default: 'main'
+      project_type:
+        description: 'Project type'
+        required: true
+        default: 'backend'
+        type: choice
+        options:
+          - backend
+          - frontend
 
 env:
   DOTNET_VERSION: '8.0.x'
-  PROJECT_PATH: 'src/AzureDeployPoc/AzureDeployPoc.csproj'
+  NODE_VERSION: '20.x'
 
 jobs:
+  detect-and-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      project_type: ${{ steps.detect.outputs.project_type }}
+      project_path: ${{ steps.detect.outputs.project_path }}
+      build_command: ${{ steps.detect.outputs.build_command }}
+      output_path: ${{ steps.detect.outputs.output_path }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.ref || 'main' }}
+
+    - name: Detect Project Type
+      id: detect
+      run: |
+        PROJECT_TYPE="${{ github.event.inputs.project_type || 'backend' }}"
+        
+        # Auto-detect if not specified or validate
+        if [ -f "package.json" ]; then
+          # Check if it's a frontend project
+          if grep -q '"react"\|"vue"\|"@angular/core"\|"next"\|"vite"' package.json 2>/dev/null; then
+            PROJECT_TYPE="frontend"
+          fi
+        fi
+        
+        if [ -f "*.csproj" ] || find . -name "*.csproj" -type f | head -1 | grep -q "."; then
+          # Has .NET project file
+          if [ "$PROJECT_TYPE" != "frontend" ]; then
+            PROJECT_TYPE="backend"
+          fi
+        fi
+        
+        echo "project_type=$PROJECT_TYPE" >> $GITHUB_OUTPUT
+        
+        # Set paths based on project type
+        if [ "$PROJECT_TYPE" = "frontend" ]; then
+          # Detect frontend framework and set build output
+          if [ -f "package.json" ]; then
+            if grep -q '"next"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=out" >> $GITHUB_OUTPUT
+            elif grep -q '"vite"\|"@vitejs"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            elif grep -q '"react-scripts"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=build" >> $GITHUB_OUTPUT
+            elif grep -q '"@angular/core"' package.json; then
+              echo "build_command=npm run build -- --configuration production" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            elif grep -q '"vue"' package.json; then
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            else
+              echo "build_command=npm run build" >> $GITHUB_OUTPUT
+              echo "output_path=dist" >> $GITHUB_OUTPUT
+            fi
+          fi
+          echo "project_path=." >> $GITHUB_OUTPUT
+        else
+          # Backend - find .csproj file
+          CSPROJ_PATH=$(find . -name "*.csproj" -type f | head -1)
+          if [ -n "$CSPROJ_PATH" ]; then
+            echo "project_path=$CSPROJ_PATH" >> $GITHUB_OUTPUT
+          else
+            echo "project_path=." >> $GITHUB_OUTPUT
+          fi
+          echo "build_command=dotnet build" >> $GITHUB_OUTPUT
+          echo "output_path=publish" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "Detected project type: $PROJECT_TYPE"
+
   terraform:
     runs-on: ubuntu-latest
+    needs: detect-and-setup
     outputs:
       webapp_name: ${{ steps.terraform_output.outputs.webapp_name }}
       resource_group: ${{ steps.terraform_output.outputs.resource_group }}
+      static_webapp_name: ${{ steps.terraform_output.outputs.static_webapp_name }}
+      deployment_token: ${{ steps.terraform_output.outputs.deployment_token }}
 
     steps:
     - name: Checkout code
@@ -48,38 +134,51 @@ jobs:
     - name: Import Existing Resources
       working-directory: ./terraform
       run: |
-        # Build resource group name (matching Terraform's naming logic)
         APP_NAME="${{ github.event.repository.name }}"
         RG_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '_.' '--')-rg
+        SUBSCRIPTION_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+        PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
         
-        echo "=== Checking Resource Group: $RG_NAME ==="
+        echo "=========================================="
+        echo "Project Type: $PROJECT_TYPE"
+        echo "Checking Resource Group: $RG_NAME"
+        echo "=========================================="
         
         # Check if resource group exists in Azure
         RG_EXISTS=$(az group exists --name "$RG_NAME")
         
         if [ "$RG_EXISTS" = "true" ]; then
-          echo "Resource group '$RG_NAME' exists in Azure."
+          echo "Resource group '$RG_NAME' EXISTS in Azure"
           
           # Check if already in Terraform state
-          if terraform state list | grep -q "azurerm_resource_group.main"; then
-            echo "Resource group already in Terraform state. Skipping import."
+          if terraform state list 2>/dev/null | grep -q "azurerm_resource_group.main"; then
+            echo "Already in Terraform state - SKIP IMPORT"
           else
             echo "Importing resource group into Terraform state..."
-            RG_ID="/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/$RG_NAME"
-            terraform import -var="app_name=$APP_NAME" azurerm_resource_group.main "$RG_ID"
-            echo "Import successful."
+            RG_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME"
+            terraform import -var="app_name=$APP_NAME" -var="project_type=$PROJECT_TYPE" azurerm_resource_group.main "$RG_ID"
+            echo "Import successful"
           fi
         else
-          echo "Resource group '$RG_NAME' does not exist in Azure. Terraform will create it."
+          echo "Resource group '$RG_NAME' does NOT exist - will be created"
         fi
 
     - name: Terraform Plan
       working-directory: ./terraform
       run: |
-        if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ]; then
-          terraform plan -var="app_name=${{ github.event.repository.name }}" -var="sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}" -out=tfplan
+        PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
+        
+        if [ -n "${{ secrets.SQL_ADMIN_PASSWORD }}" ] && [ "$PROJECT_TYPE" = "backend" ]; then
+          terraform plan \
+            -var="app_name=${{ github.event.repository.name }}" \
+            -var="project_type=$PROJECT_TYPE" \
+            -var="sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}" \
+            -out=tfplan
         else
-          terraform plan -var="app_name=${{ github.event.repository.name }}" -out=tfplan
+          terraform plan \
+            -var="app_name=${{ github.event.repository.name }}" \
+            -var="project_type=$PROJECT_TYPE" \
+            -out=tfplan
         fi
 
     - name: Terraform Apply
@@ -90,12 +189,21 @@ jobs:
       id: terraform_output
       working-directory: ./terraform
       run: |
-        echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
         echo "resource_group=$(terraform output -raw resource_group)" >> $GITHUB_OUTPUT
+        
+        PROJECT_TYPE="${{ needs.detect-and-setup.outputs.project_type }}"
+        
+        if [ "$PROJECT_TYPE" = "backend" ]; then
+          echo "webapp_name=$(terraform output -raw webapp_name)" >> $GITHUB_OUTPUT
+        else
+          echo "static_webapp_name=$(terraform output -raw static_webapp_name)" >> $GITHUB_OUTPUT
+          echo "deployment_token=$(terraform output -raw static_webapp_api_key)" >> $GITHUB_OUTPUT
+        fi
 
-  build:
+  build-backend:
     runs-on: ubuntu-latest
-    needs: terraform
+    needs: [detect-and-setup, terraform]
+    if: needs.detect-and-setup.outputs.project_type == 'backend'
 
     steps:
     - name: Checkout code
@@ -109,13 +217,13 @@ jobs:
         dotnet-version: ${{ env.DOTNET_VERSION }}
 
     - name: Restore dependencies
-      run: dotnet restore ${{ env.PROJECT_PATH }}
+      run: dotnet restore ${{ needs.detect-and-setup.outputs.project_path }}
 
     - name: Build
-      run: dotnet build ${{ env.PROJECT_PATH }} --configuration Release --no-restore
+      run: dotnet build ${{ needs.detect-and-setup.outputs.project_path }} --configuration Release --no-restore
 
     - name: Publish
-      run: dotnet publish ${{ env.PROJECT_PATH }} --configuration Release --output ./publish --no-build
+      run: dotnet publish ${{ needs.detect-and-setup.outputs.project_path }} --configuration Release --output ./publish --no-build
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -123,9 +231,41 @@ jobs:
         name: webapp-artifact
         path: ./publish
 
-  deploy:
+  build-frontend:
     runs-on: ubuntu-latest
-    needs: [terraform, build]
+    needs: [detect-and-setup, terraform]
+    if: needs.detect-and-setup.outputs.project_type == 'frontend'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.ref || 'main' }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build
+      run: ${{ needs.detect-and-setup.outputs.build_command }}
+      env:
+        CI: false
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-artifact
+        path: ${{ needs.detect-and-setup.outputs.output_path }}
+
+  deploy-backend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-backend]
+    if: needs.detect-and-setup.outputs.project_type == 'backend'
 
     steps:
     - name: Download artifact
@@ -150,3 +290,24 @@ jobs:
       with:
         app-name: ${{ needs.terraform.outputs.webapp_name }}
         package: ./publish
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: [detect-and-setup, terraform, build-frontend]
+    if: needs.detect-and-setup.outputs.project_type == 'frontend'
+
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: frontend-artifact
+        path: ./dist
+
+    - name: Deploy to Azure Static Web App
+      uses: Azure/static-web-apps-deploy@v1
+      with:
+        azure_static_web_apps_api_token: ${{ needs.terraform.outputs.deployment_token }}
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        action: "upload"
+        app_location: "./dist"
+        skip_app_build: true
